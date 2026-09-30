@@ -18,10 +18,10 @@ GIORNI = ["Lunedì", "Martedì", "Mercoledì", "Giovedì", "Venerdì", "Sabato",
 STATI = ["In Bozza", "Confermato", "Rifiutato"]
 
 COLONNE_ANAGRAFICA = [
-    "ID_Medico", "Nome", "Cognome", "Provincia", "Citta", "Indirizzo",
+    "ID_Medico", "ID_Sede", "Nome", "Cognome", "Provincia", "Citta", "Indirizzo",
     "Frequenza_Target_Giorni",
 ]
-COLONNE_DISPONIBILITA = ["ID_Medico", "Giorno_Settimana", "Ora_Inizio", "Ora_Fine"]
+COLONNE_DISPONIBILITA = ["ID_Medico", "ID_Sede", "Giorno_Settimana", "Ora_Inizio", "Ora_Fine"]
 COLONNE_VISITE = ["ID_Medico", "Data_Ultima_Visita"]
 
 
@@ -45,6 +45,11 @@ def normalizza(testo):
 
 def testo_pulito(valore):
     return "" if pd.isna(valore) else str(valore).strip()
+
+
+def sede_norm(valore):
+    """Sede normalizzata: 'A', 'a ' -> 'a'. Vuoto resta vuoto."""
+    return normalizza(testo_pulito(valore))
 
 
 def orario_in_minuti(valore):
@@ -134,13 +139,15 @@ def matrice_durate(coords, chiave):
 def pianifica(liberi, fissi, durate, inizio_giornata, fine_giornata, durata_visita, max_visite):
     """
     Costruisce la giornata passo dopo passo:
-    - a ogni passo sceglie, tra i medici disponibili, quello raggiungibile per primo
+    - a ogni passo sceglie, tra i candidati disponibili, quello raggiungibile per primo
       (a parità, quello più urgente) che rispetta la sua finestra oraria;
-    - le visite 'fisse' (già confermate) non si spostano: le altre si incastrano nei buchi.
+    - le visite 'fisse' (già confermate) non si spostano: le altre si incastrano nei buchi;
+    - un medico viene inserito al massimo una volta al giorno, anche se ha più sedi.
     Non è un ottimizzatore perfetto: è una buona euristica.
     """
     liberi = list(liberi)
     fissi = sorted(fissi, key=lambda a: a["inizio"])
+    ids_usati = {f["id"] for f in fissi}
     max_liberi = max(0, max_visite - len(fissi))
     n_liberi = 0
     agenda = []
@@ -156,6 +163,8 @@ def pianifica(liberi, fissi, durate, inizio_giornata, fine_giornata, durata_visi
 
         if n_liberi < max_liberi:
             for c in liberi:
+                if c["id"] in ids_usati:
+                    continue
                 tv = 0 if pos is None else viaggio(pos, c)
                 for ini, fin in c["finestre"]:
                     arrivo = max(t + tv, ini)
@@ -174,6 +183,7 @@ def pianifica(liberi, fissi, durate, inizio_giornata, fine_giornata, durata_visi
             app.update(inizio=arrivo, fine=arrivo + durata_visita, guida=tv, fisso=False)
             agenda.append(app)
             liberi.remove(c)
+            ids_usati.add(c["id"])
             n_liberi += 1
             t = arrivo + durata_visita
             pos = c
@@ -221,6 +231,40 @@ for nome, df, cols in [
         st.error(f"Nel foglio '{nome}' mancano le colonne: {', '.join(mancanti)}")
         st.stop()
 
+# Colonne di servizio per il confronto delle sedi
+df_anag = df_anag.copy()
+df_disp = df_disp.copy()
+df_anag["_sede"] = df_anag["ID_Sede"].apply(sede_norm)
+df_disp["_sede"] = df_disp["ID_Sede"].apply(sede_norm)
+
+# Controlli di coerenza sui dati
+avvisi_dati = []
+
+duplicati = df_anag.duplicated(subset=["ID_Medico", "_sede"], keep="first")
+if duplicati.any():
+    for _, r in df_anag[duplicati].iterrows():
+        avvisi_dati.append(
+            f"Anagrafica: la coppia ID_Medico '{r['ID_Medico']}' + ID_Sede '{testo_pulito(r['ID_Sede'])}' "
+            f"compare più volte. Viene usata solo la prima riga."
+        )
+    df_anag = df_anag[~duplicati]
+
+sedi_valide = set(zip(df_anag["ID_Medico"], df_anag["_sede"]))
+for _, r in df_disp.iterrows():
+    if pd.isna(r["ID_Medico"]):
+        continue
+    if (r["ID_Medico"], r["_sede"]) not in sedi_valide:
+        avvisi_dati.append(
+            f"Disponibilita: la riga di {r['ID_Medico']} (sede '{testo_pulito(r['ID_Sede'])}', "
+            f"{testo_pulito(r['Giorno_Settimana'])}) non corrisponde a nessuna sede in Anagrafica. "
+            f"Riga ignorata."
+        )
+
+if avvisi_dati:
+    with st.expander(f"⚠️ Controllo dati: {len(avvisi_dati)} segnalazioni", expanded=False):
+        for a_ in avvisi_dati:
+            st.write(f"• {a_}")
+
 # -----------------------------------------------------------------------------
 # BARRA LATERALE
 # -----------------------------------------------------------------------------
@@ -261,9 +305,10 @@ if st.sidebar.button("🚀 Calcola proposta agenda", type="primary"):
     avvisi = []
     candidati = []
 
-    medici = df_anag[df_anag["Provincia"] == provincia_sel]
+    # Ogni riga di Anagrafica è una sede di un medico
+    sedi = df_anag[df_anag["Provincia"] == provincia_sel]
     if citta_sel != "Tutte":
-        medici = medici[medici["Citta"] == citta_sel]
+        sedi = sedi[sedi["Citta"] == citta_sel]
 
     disp_giorno = df_disp[
         df_disp["Giorno_Settimana"].apply(
@@ -271,26 +316,33 @@ if st.sidebar.button("🚀 Calcola proposta agenda", type="primary"):
         )
     ]
 
-    for _, r in medici.iterrows():
+    for _, r in sedi.iterrows():
         id_m = r["ID_Medico"]
+        sede = r["_sede"]
 
-        # Finestre orarie del giorno scelto
+        # Finestre orarie del giorno scelto, solo per questa sede
         finestre = []
-        for _, riga in disp_giorno[disp_giorno["ID_Medico"] == id_m].iterrows():
+        righe_disp = disp_giorno[
+            (disp_giorno["ID_Medico"] == id_m) & (disp_giorno["_sede"] == sede)
+        ]
+        for _, riga in righe_disp.iterrows():
             ini = orario_in_minuti(riga["Ora_Inizio"])
             fin = orario_in_minuti(riga["Ora_Fine"])
             if ini is None or fin is None or fin <= ini:
-                avvisi.append(f"Orario non valido per {id_m}: ignorata una riga di Disponibilita.")
+                avvisi.append(
+                    f"Orario non valido per {id_m} (sede '{testo_pulito(r['ID_Sede'])}'): "
+                    f"ignorata una riga di Disponibilita."
+                )
                 continue
             finestre.append((ini, fin))
         if not finestre:
             continue
 
-        # Frequenza target del singolo medico
+        # Frequenza target
         freq = pd.to_numeric(r["Frequenza_Target_Giorni"], errors="coerce")
         freq = 30 if pd.isna(freq) or freq <= 0 else int(freq)
 
-        # Ultima visita
+        # Ultima visita: condivisa tra tutte le sedi del medico
         date_visite = [
             leggi_data(x)
             for x in df_visite[df_visite["ID_Medico"] == id_m]["Data_Ultima_Visita"]
@@ -315,6 +367,8 @@ if st.sidebar.button("🚀 Calcola proposta agenda", type="primary"):
 
         candidati.append({
             "id": id_m,
+            "key": f"{id_m}|{sede}",
+            "sede": testo_pulito(r["ID_Sede"]),
             "nome": nome_completo,
             "indirizzo": indirizzo_completo,
             "finestre": finestre,
@@ -340,7 +394,7 @@ if st.sidebar.button("🚀 Calcola proposta agenda", type="primary"):
                     coord = geocodifica(f"{c['indirizzo']}, Italia", chiave_ors)
                     if coord is None:
                         avvisi.append(
-                            f"Indirizzo non trovato per {c['nome']}: '{c['indirizzo']}'. Medico escluso."
+                            f"Indirizzo non trovato per {c['nome']}: '{c['indirizzo']}'. Sede esclusa."
                         )
                     else:
                         c["i"] = len(validi)
@@ -372,7 +426,7 @@ if st.sidebar.button("🚀 Calcola proposta agenda", type="primary"):
             "citta": citta_sel,
             "candidati": validi,
             "durate": durate,
-            "rifiutati": set(),
+            "rifiutati": set(),  # ID dei medici rifiutati (valgono per tutte le sedi)
             "avvisi": avvisi,
             "inizio": inizio_g,
             "fine": fine_g,
@@ -409,17 +463,18 @@ for a in agenda:
     c1.markdown(
         f"**{'🔒 ' if a.get('fisso') else ''}{minuti_in_orario(a['inizio'])}–{minuti_in_orario(a['fine'])}**"
     )
-    c2.markdown(f"**{a['nome']}**  \n_{a['indirizzo']}_")
+    etichetta_sede = f" · Sede {a['sede']}" if a.get("sede") else ""
+    c2.markdown(f"**{a['nome']}**{etichetta_sede}  \n_{a['indirizzo']}_")
     if a["giorni"] is None:
         storico = "Mai visitato"
     else:
         storico = f"Ultima visita {a['giorni']} gg fa (target {a['freq']} gg)"
     c3.caption(f"{storico} · guida da tappa precedente: {a['guida']} min")
-    c4.selectbox("Stato", STATI, key=f"stato_{a['id']}", label_visibility="collapsed")
+    c4.selectbox("Stato", STATI, key=f"stato_{a['key']}", label_visibility="collapsed")
 
 
 def stato_di(a):
-    return st.session_state.get(f"stato_{a['id']}", "In Bozza")
+    return st.session_state.get(f"stato_{a['key']}", "In Bozza")
 
 
 # -----------------------------------------------------------------------------
@@ -451,7 +506,11 @@ esclusi = [
 if esclusi:
     with st.expander(f"Medici in scadenza NON inseriti oggi ({len(esclusi)})"):
         for c in esclusi:
-            st.write(f"• {c['nome']} — manca spazio, orario compatibile o si è raggiunto il massimo di visite")
+            sede_txt = f" (sede {c['sede']})" if c.get("sede") else ""
+            st.write(
+                f"• {c['nome']}{sede_txt} — manca spazio, orario compatibile "
+                f"o si è raggiunto il massimo di visite"
+            )
 
 # -----------------------------------------------------------------------------
 # RIEPILOGO, SALVATAGGIO E NAVIGAZIONE
@@ -463,9 +522,11 @@ if attive:
 
     confermati = [a for a in attive if stato_di(a) == "Confermato"]
     if confermati:
+        # Una riga per medico (la data di ultima visita è condivisa tra le sedi)
+        id_confermati = list(dict.fromkeys(a["id"] for a in confermati))
         df_out = pd.DataFrame({
-            "ID_Medico": [a["id"] for a in confermati],
-            "Data_Ultima_Visita": [ctx["data"].isoformat()] * len(confermati),
+            "ID_Medico": id_confermati,
+            "Data_Ultima_Visita": [ctx["data"].isoformat()] * len(id_confermati),
         })
         st.download_button(
             "⬇️ Scarica visite confermate (da copiare in Registro_Visite)",
