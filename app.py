@@ -70,6 +70,11 @@ def minuti_in_orario(minuti):
     return f"{minuti // 60:02d}:{minuti % 60:02d}"
 
 
+def minuti_in_time(minuti):
+    minuti = max(0, min(int(minuti), 23 * 60 + 59))
+    return time(minuti // 60, minuti % 60)
+
+
 def leggi_data(valore):
     """Accetta 2026-08-15 oppure 15/08/2026."""
     if pd.isna(valore):
@@ -141,7 +146,8 @@ def pianifica(liberi, fissi, durate, inizio_giornata, fine_giornata, durata_visi
     Costruisce la giornata passo dopo passo:
     - a ogni passo sceglie, tra i candidati disponibili, quello raggiungibile per primo
       (a parità, quello più urgente) che rispetta la sua finestra oraria;
-    - le visite 'fisse' (già confermate) non si spostano: le altre si incastrano nei buchi;
+    - le visite 'fisse' (confermate, con l'orario deciso dall'utente) non si spostano:
+      le altre si incastrano nei buchi;
     - un medico viene inserito al massimo una volta al giorno, anche se ha più sedi.
     Non è un ottimizzatore perfetto: è una buona euristica.
     """
@@ -380,8 +386,8 @@ if st.sidebar.button("🚀 Calcola proposta agenda", type="primary"):
             "priorita": priorita,
         })
 
-    # Azzera gli stati dei menu della proposta precedente
-    for k in [k for k in st.session_state if k.startswith("stato_")]:
+    # Azzera stati e orari della proposta precedente
+    for k in [k for k in st.session_state if k.startswith(("stato_", "ora_"))]:
         del st.session_state[k]
 
     if not candidati:
@@ -435,6 +441,7 @@ if st.sidebar.button("🚀 Calcola proposta agenda", type="primary"):
             "fine": fine_g,
             "durata_visita": int(durata_visita),
             "max_visite": int(max_visite),
+            "ver": 0,  # cambia a ogni ricalcolo: rinnova i campi orario
         }
         st.session_state["agenda"] = pianifica(
             validi, [], durate, inizio_g, fine_g, int(durata_visita), int(max_visite)
@@ -450,6 +457,23 @@ if not ctx:
     st.info("Usa il pannello laterale e clicca 'Calcola proposta agenda'.")
     st.stop()
 
+
+def stato_di(a):
+    return st.session_state.get(f"stato_{a['key']}", "In Bozza")
+
+
+def chiave_ora(a):
+    return f"ora_{a['key']}_{ctx['ver']}"
+
+
+def inizio_scelto(a):
+    """Orario di inizio attualmente impostato (in minuti)."""
+    v = st.session_state.get(chiave_ora(a))
+    if isinstance(v, time):
+        return v.hour * 60 + v.minute
+    return a["inizio"]
+
+
 luogo = f"Provincia di {ctx['provincia']}"
 if ctx["citta"]:
     luogo += " — " + ", ".join(ctx["citta"])
@@ -463,9 +487,17 @@ if not agenda:
 
 for a in agenda:
     c1, c2, c3, c4 = st.columns([2, 4, 3, 2])
-    c1.markdown(
-        f"**{'🔒 ' if a.get('fisso') else ''}{minuti_in_orario(a['inizio'])}–{minuti_in_orario(a['fine'])}**"
+    bloccato = stato_di(a) == "Confermato"
+    c1.time_input(
+        "Orario",
+        value=minuti_in_time(a["inizio"]),
+        step=60,
+        key=chiave_ora(a),
+        disabled=bloccato,
+        label_visibility="collapsed",
     )
+    if bloccato:
+        c1.caption("🔒 confermato")
     etichetta_sede = f" · Sede {a['sede']}" if a.get("sede") else ""
     c2.markdown(f"**{a['nome']}**{etichetta_sede}  \n_{a['indirizzo']}_")
     if a["giorni"] is None:
@@ -475,29 +507,64 @@ for a in agenda:
     c3.caption(f"{storico} · guida da tappa precedente: {a['guida']} min")
     c4.selectbox("Stato", STATI, key=f"stato_{a['key']}", label_visibility="collapsed")
 
+# -----------------------------------------------------------------------------
+# CONTROLLI SUGLI ORARI IMPOSTATI
+# -----------------------------------------------------------------------------
+durata = ctx["durata_visita"]
+attive = [a for a in agenda if stato_di(a) != "Rifiutato"]
+attive.sort(key=inizio_scelto)
 
-def stato_di(a):
-    return st.session_state.get(f"stato_{a['key']}", "In Bozza")
+for a in attive:
+    ini = inizio_scelto(a)
+    if not any(ini >= f_ini and ini + durata <= f_fin for f_ini, f_fin in a["finestre"]):
+        fasce = ", ".join(f"{minuti_in_orario(x)}–{minuti_in_orario(y)}" for x, y in a["finestre"])
+        st.warning(
+            f"⏰ {a['nome']}: l'orario {minuti_in_orario(ini)}–{minuti_in_orario(ini + durata)} "
+            f"è fuori dalla disponibilità registrata ({fasce})."
+        )
 
+for prima, dopo in zip(attive, attive[1:]):
+    if inizio_scelto(dopo) < inizio_scelto(prima) + durata:
+        st.warning(
+            f"⚠️ Sovrapposizione: {prima['nome']} ({minuti_in_orario(inizio_scelto(prima))}) "
+            f"e {dopo['nome']} ({minuti_in_orario(inizio_scelto(dopo))})."
+        )
 
 # -----------------------------------------------------------------------------
-# RICALCOLO DOPO I RIFIUTI
+# RICALCOLO
 # -----------------------------------------------------------------------------
-st.caption("🔒 = visita confermata: l'orario resta fisso. Le altre si riorganizzano attorno a queste.")
+st.caption(
+    "Modifica l'orario finché il medico non conferma. Con **Confermato** l'orario si blocca (🔒). "
+    "**Ricalcola giornata** mantiene i confermati all'orario impostato, toglie i rifiutati "
+    "e ricalcola le visite in bozza. Non ricaricare la pagina del browser: si perderebbe l'agenda."
+)
 
-if agenda and st.button("🔄 Ricalcola giornata (rimuove i rifiutati, mantiene i confermati)"):
-    rifiutati_ora = {a["id"] for a in agenda if stato_di(a) == "Rifiutato"}
-    ctx["rifiutati"] |= rifiutati_ora
-    fissi = [a for a in agenda if stato_di(a) == "Confermato"]
+if agenda and st.button("🔄 Ricalcola giornata"):
+    ctx["rifiutati"] |= {a["id"] for a in agenda if stato_di(a) == "Rifiutato"}
+
+    fissi = []
+    for a in agenda:
+        if stato_di(a) == "Confermato":
+            ini = inizio_scelto(a)
+            f = dict(a)
+            f.update(inizio=ini, fine=ini + durata, fisso=True)
+            fissi.append(f)
+
     id_fissi = {a["id"] for a in fissi}
     liberi = [
         c for c in ctx["candidati"]
         if c["id"] not in ctx["rifiutati"] and c["id"] not in id_fissi
     ]
-    st.session_state["agenda"] = pianifica(
+    nuova = pianifica(
         liberi, fissi, ctx["durate"], ctx["inizio"], ctx["fine"],
         ctx["durata_visita"], ctx["max_visite"],
     )
+
+    # Rinnova i campi orario: quelli vecchi vengono eliminati
+    for k in [k for k in st.session_state if k.startswith("ora_")]:
+        del st.session_state[k]
+    ctx["ver"] += 1
+    st.session_state["agenda"] = nuova
     st.rerun()
 
 # Medici in scadenza non inseriti
@@ -518,10 +585,9 @@ if esclusi:
 # -----------------------------------------------------------------------------
 # RIEPILOGO, SALVATAGGIO E NAVIGAZIONE
 # -----------------------------------------------------------------------------
-attive = [a for a in agenda if stato_di(a) != "Rifiutato"]
 if attive:
     st.divider()
-    st.metric("Tempo totale di guida stimato", f"{sum(a['guida'] for a in attive)} min")
+    st.metric("Tempo totale di guida stimato (da ultima proposta)", f"{sum(a['guida'] for a in attive)} min")
 
     confermati = [a for a in attive if stato_di(a) == "Confermato"]
     if confermati:
@@ -538,6 +604,7 @@ if attive:
             mime="text/csv",
         )
 
+    # Percorso nell'ordine degli orari impostati
     tappe = [urllib.parse.quote(a["indirizzo"], safe="") for a in attive]
     url_maps = "https://www.google.com/maps/dir/" + "/".join(tappe)
     st.markdown(f"👉 **[Apri il percorso su Google Maps]({url_maps})**")
