@@ -282,7 +282,10 @@ provincia_sel = st.sidebar.selectbox("Provincia", province)
 citta_disponibili = sorted(
     df_anag[df_anag["Provincia"] == provincia_sel]["Citta"].dropna().unique()
 )
-citta_sel = st.sidebar.selectbox("Città", ["Tutte"] + citta_disponibili)
+citta_sel = st.sidebar.multiselect(
+    "Città (nessuna selezionata = tutte)",
+    citta_disponibili,
+)
 
 data_sel = st.sidebar.date_input("Giorno da pianificare", value=date.today())
 giorno_sel = GIORNI[data_sel.weekday()]
@@ -307,8 +310,8 @@ if st.sidebar.button("🚀 Calcola proposta agenda", type="primary"):
 
     # Ogni riga di Anagrafica è una sede di un medico
     sedi = df_anag[df_anag["Provincia"] == provincia_sel]
-    if citta_sel != "Tutte":
-        sedi = sedi[sedi["Citta"] == citta_sel]
+    if citta_sel:
+        sedi = sedi[sedi["Citta"].isin(citta_sel)]
 
     disp_giorno = df_disp[
         df_disp["Giorno_Settimana"].apply(
@@ -423,7 +426,7 @@ if st.sidebar.button("🚀 Calcola proposta agenda", type="primary"):
             "data": data_sel,
             "giorno": giorno_sel,
             "provincia": provincia_sel,
-            "citta": citta_sel,
+            "citta": list(citta_sel),  # lista vuota = tutte le città
             "candidati": validi,
             "durate": durate,
             "rifiutati": set(),  # ID dei medici rifiutati (valgono per tutte le sedi)
@@ -448,8 +451,8 @@ if not ctx:
     st.stop()
 
 luogo = f"Provincia di {ctx['provincia']}"
-if ctx["citta"] != "Tutte":
-    luogo += f" — {ctx['citta']}"
+if ctx["citta"]:
+    luogo += " — " + ", ".join(ctx["citta"])
 st.subheader(f"📅 {ctx['giorno']} {ctx['data'].strftime('%d/%m/%Y')} — {luogo}")
 
 for avviso in ctx["avvisi"]:
