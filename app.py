@@ -23,6 +23,7 @@ COLONNE_ANAGRAFICA = [
 ]
 COLONNE_DISPONIBILITA = ["ID_Medico", "ID_Sede", "Giorno_Settimana", "Ora_Inizio", "Ora_Fine"]
 COLONNE_VISITE = ["ID_Medico", "Data_Ultima_Visita"]
+COLONNE_APPUNTAMENTI = ["ID_Medico", "ID_Sede", "Data_Appuntamento", "Ora_Appuntamento"]
 
 
 # -----------------------------------------------------------------------------
@@ -146,8 +147,8 @@ def pianifica(liberi, fissi, durate, inizio_giornata, fine_giornata, durata_visi
     Costruisce la giornata passo dopo passo:
     - a ogni passo sceglie, tra i candidati disponibili, quello raggiungibile per primo
       (a parità, quello più urgente) che rispetta la sua finestra oraria;
-    - le visite 'fisse' (confermate, con l'orario deciso dall'utente) non si spostano:
-      le altre si incastrano nei buchi;
+    - le visite 'fisse' (confermate o già prese, con l'orario deciso dall'utente)
+      non si spostano: le altre si incastrano nei buchi;
     - un medico viene inserito al massimo una volta al giorno, anche se ha più sedi.
     Non è un ottimizzatore perfetto: è una buona euristica.
     """
@@ -266,10 +267,79 @@ for _, r in df_disp.iterrows():
             f"Riga ignorata."
         )
 
+# Appuntamenti già presi (foglio facoltativo)
+appuntamenti = []
+try:
+    df_app = leggi_foglio(sheet_id, "Appuntamenti")
+    if all(c in df_app.columns for c in COLONNE_APPUNTAMENTI):
+        for _, r in df_app.iterrows():
+            if pd.isna(r["ID_Medico"]):
+                continue
+            d_app = leggi_data(r["Data_Appuntamento"])
+            o_app = orario_in_minuti(r["Ora_Appuntamento"])
+            if d_app is None or o_app is None:
+                avvisi_dati.append(
+                    f"Appuntamenti: la riga di {r['ID_Medico']} ha data o ora non valida. Riga ignorata."
+                )
+                continue
+            appuntamenti.append({
+                "id": r["ID_Medico"],
+                "sede": sede_norm(r["ID_Sede"]),
+                "data": d_app,
+                "ora": o_app,
+            })
+    else:
+        st.warning(
+            "Foglio 'Appuntamenti' non trovato o con intestazioni diverse da "
+            "ID_Medico, ID_Sede, Data_Appuntamento, Ora_Appuntamento: "
+            "gli appuntamenti già presi non vengono considerati."
+        )
+except Exception:
+    st.warning(
+        "Foglio 'Appuntamenti' non leggibile: gli appuntamenti già presi non vengono considerati."
+    )
+
 if avvisi_dati:
     with st.expander(f"⚠️ Controllo dati: {len(avvisi_dati)} segnalazioni", expanded=False):
         for a_ in avvisi_dati:
             st.write(f"• {a_}")
+
+
+def trova_sede(id_m, sede):
+    """Riga di Anagrafica della sede indicata (o l'unica sede, se non specificata)."""
+    righe = df_anag[df_anag["ID_Medico"] == id_m]
+    if righe.empty:
+        return None
+    if sede:
+        r2 = righe[righe["_sede"] == sede]
+        return None if r2.empty else r2.iloc[0]
+    if len(righe) == 1:
+        return righe.iloc[0]
+    return None
+
+
+def giorni_da_ultima_visita(id_m, data_rif):
+    ds = [
+        leggi_data(x)
+        for x in df_visite[df_visite["ID_Medico"] == id_m]["Data_Ultima_Visita"]
+    ]
+    ds = [x for x in ds if x]
+    return (data_rif - max(ds)).days if ds else None
+
+
+def nome_di(r):
+    return f"{testo_pulito(r['Nome'])} {testo_pulito(r['Cognome'])}".strip()
+
+
+def indirizzo_di(r):
+    parti = [testo_pulito(r["Indirizzo"]), testo_pulito(r["Citta"]), testo_pulito(r["Provincia"])]
+    return ", ".join(x for x in parti if x)
+
+
+def frequenza_di(r):
+    f = pd.to_numeric(r["Frequenza_Target_Giorni"], errors="coerce")
+    return 30 if pd.isna(f) or f <= 0 else int(f)
+
 
 # -----------------------------------------------------------------------------
 # BARRA LATERALE
@@ -313,8 +383,51 @@ if st.sidebar.button("🚀 Calcola proposta agenda", type="primary"):
 
     avvisi = []
     candidati = []
+    durata_int = int(durata_visita)
 
-    # Ogni riga di Anagrafica è una sede di un medico
+    # Appuntamenti già presi: quelli di oggi diventano visite fisse,
+    # quelli futuri bloccano il medico (non viene proposto prima)
+    app_giorno = [x for x in appuntamenti if x["data"] == data_sel]
+    ids_app_giorno = {x["id"] for x in app_giorno}
+    ids_bloccati = {x["id"] for x in appuntamenti if x["data"] > data_sel}
+
+    # Visite già prese per il giorno pianificato
+    gia_inseriti = set()
+    for x in app_giorno:
+        if x["id"] in gia_inseriti:
+            continue
+        r = trova_sede(x["id"], x["sede"])
+        if r is None:
+            avvisi.append(
+                f"Appuntamento di {x['id']} del giorno non inserito: sede '{x['sede']}' "
+                f"non trovata in Anagrafica."
+            )
+            continue
+        if r["Provincia"] != provincia_sel or (citta_sel and r["Citta"] not in citta_sel):
+            avvisi.append(
+                f"ℹ️ {nome_di(r)} ha un appuntamento alle {minuti_in_orario(x['ora'])} "
+                f"a {testo_pulito(r['Citta'])}, ma è fuori dai filtri di provincia/città selezionati."
+            )
+            gia_inseriti.add(x["id"])
+            continue
+        gia_inseriti.add(x["id"])
+        candidati.append({
+            "id": x["id"],
+            "key": f"{x['id']}|{r['_sede']}",
+            "sede": testo_pulito(r["ID_Sede"]),
+            "nome": nome_di(r),
+            "indirizzo": indirizzo_di(r),
+            "finestre": [(x["ora"], x["ora"] + durata_int)],
+            "freq": frequenza_di(r),
+            "giorni": giorni_da_ultima_visita(x["id"], data_sel),
+            "priorita": 0.0,
+            "preso": True,
+            "inizio": x["ora"],
+            "fine": x["ora"] + durata_int,
+            "fisso": True,
+        })
+
+    # Proposte normali
     sedi = df_anag[df_anag["Provincia"] == provincia_sel]
     if citta_sel:
         sedi = sedi[sedi["Citta"].isin(citta_sel)]
@@ -328,6 +441,10 @@ if st.sidebar.button("🚀 Calcola proposta agenda", type="primary"):
     for _, r in sedi.iterrows():
         id_m = r["ID_Medico"]
         sede = r["_sede"]
+
+        # Medico con appuntamento già preso (oggi o più avanti): non si propone
+        if id_m in ids_bloccati or id_m in ids_app_giorno:
+            continue
 
         # Finestre orarie del giorno scelto, solo per questa sede
         finestre = []
@@ -347,39 +464,25 @@ if st.sidebar.button("🚀 Calcola proposta agenda", type="primary"):
         if not finestre:
             continue
 
-        # Frequenza target
-        freq = pd.to_numeric(r["Frequenza_Target_Giorni"], errors="coerce")
-        freq = 30 if pd.isna(freq) or freq <= 0 else int(freq)
+        freq = frequenza_di(r)
 
         # Ultima visita: condivisa tra tutte le sedi del medico
-        date_visite = [
-            leggi_data(x)
-            for x in df_visite[df_visite["ID_Medico"] == id_m]["Data_Ultima_Visita"]
-        ]
-        date_visite = [x for x in date_visite if x]
-        if date_visite:
-            giorni = (data_sel - max(date_visite)).days
+        giorni = giorni_da_ultima_visita(id_m, data_sel)
+        if giorni is not None:
             if giorni < 0:
                 continue  # ultima visita successiva al giorno pianificato
             if giorni < freq - anticipo:
                 continue  # non ancora in scadenza
             priorita = giorni / freq
         else:
-            giorni = None
             priorita = 999.0  # mai visitato: massima urgenza
-
-        nome_completo = f"{testo_pulito(r['Nome'])} {testo_pulito(r['Cognome'])}".strip()
-        via = testo_pulito(r["Indirizzo"])
-        citta = testo_pulito(r["Citta"])
-        prov = testo_pulito(r["Provincia"])
-        indirizzo_completo = ", ".join(x for x in [via, citta, prov] if x)
 
         candidati.append({
             "id": id_m,
             "key": f"{id_m}|{sede}",
             "sede": testo_pulito(r["ID_Sede"]),
-            "nome": nome_completo,
-            "indirizzo": indirizzo_completo,
+            "nome": nome_di(r),
+            "indirizzo": indirizzo_di(r),
             "finestre": finestre,
             "freq": freq,
             "giorni": giorni,
@@ -394,6 +497,8 @@ if st.sidebar.button("🚀 Calcola proposta agenda", type="primary"):
         st.session_state["ctx"] = None
         st.session_state["agenda"] = []
         st.info("Nessun medico da visitare con questi criteri (provincia, città, giorno, scadenze).")
+        for avviso in avvisi:
+            st.warning(avviso)
     else:
         try:
             with st.spinner("Calcolo indirizzi e tempi di guida..."):
@@ -428,6 +533,14 @@ if st.sidebar.button("🚀 Calcola proposta agenda", type="primary"):
 
         inizio_g = ora_inizio.hour * 60 + ora_inizio.minute
         fine_g = ora_fine.hour * 60 + ora_fine.minute
+
+        fissi_iniziali = [c for c in validi if c.get("preso")]
+        liberi_iniziali = [c for c in validi if not c.get("preso")]
+
+        # Gli appuntamenti già presi partono come "Confermato"
+        for c in fissi_iniziali:
+            st.session_state[f"stato_{c['key']}"] = "Confermato"
+
         st.session_state["ctx"] = {
             "data": data_sel,
             "giorno": giorno_sel,
@@ -439,12 +552,13 @@ if st.sidebar.button("🚀 Calcola proposta agenda", type="primary"):
             "avvisi": avvisi,
             "inizio": inizio_g,
             "fine": fine_g,
-            "durata_visita": int(durata_visita),
+            "durata_visita": durata_int,
             "max_visite": int(max_visite),
             "ver": 0,  # cambia a ogni ricalcolo: rinnova i campi orario
         }
         st.session_state["agenda"] = pianifica(
-            validi, [], durate, inizio_g, fine_g, int(durata_visita), int(max_visite)
+            liberi_iniziali, fissi_iniziali, durate, inizio_g, fine_g,
+            durata_int, int(max_visite),
         )
 
 # -----------------------------------------------------------------------------
@@ -500,7 +614,9 @@ for a in agenda:
         c1.caption("🔒 confermato")
     etichetta_sede = f" · Sede {a['sede']}" if a.get("sede") else ""
     c2.markdown(f"**{a['nome']}**{etichetta_sede}  \n_{a['indirizzo']}_")
-    if a["giorni"] is None:
+    if a.get("preso"):
+        storico = "📌 Appuntamento già preso"
+    elif a["giorni"] is None:
         storico = "Mai visitato"
     else:
         storico = f"Ultima visita {a['giorni']} gg fa (target {a['freq']} gg)"
