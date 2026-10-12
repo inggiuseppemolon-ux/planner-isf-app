@@ -17,6 +17,9 @@ st.title("🗺️ Planner Tattico di Territorio per ISF")
 GIORNI = ["Lunedì", "Martedì", "Mercoledì", "Giovedì", "Venerdì", "Sabato", "Domenica"]
 STATI = ["In Bozza", "Confermato", "Rifiutato"]
 
+# Punto di partenza predefinito (modificabile dalla barra laterale)
+PARTENZA_DEFAULT = "Via San Giovanni Lupatoto 24, Verona"
+
 COLONNE_ANAGRAFICA = [
     "ID_Medico", "ID_Sede", "Nome", "Cognome", "Provincia", "Citta", "Indirizzo",
     "Frequenza_Target_Giorni",
@@ -142,9 +145,11 @@ def matrice_durate(coords, chiave):
 # -----------------------------------------------------------------------------
 # ALGORITMO DI PIANIFICAZIONE
 # -----------------------------------------------------------------------------
-def pianifica(liberi, fissi, durate, inizio_giornata, fine_giornata, durata_visita, max_visite):
+def pianifica(liberi, fissi, durate, inizio_giornata, fine_giornata, durata_visita,
+              max_visite, partenza=None):
     """
     Costruisce la giornata passo dopo passo:
+    - parte dal punto di partenza (se presente) all'orario di inizio giornata;
     - a ogni passo sceglie, tra i candidati disponibili, quello raggiungibile per primo
       (a parità, quello più urgente) che rispetta la sua finestra oraria;
     - le visite 'fisse' (confermate o già prese, con l'orario deciso dall'utente)
@@ -159,7 +164,7 @@ def pianifica(liberi, fissi, durate, inizio_giornata, fine_giornata, durata_visi
     n_liberi = 0
     agenda = []
     t = inizio_giornata
-    pos = None
+    pos = partenza  # None oppure {"i": 0}
 
     def viaggio(a, b):
         return math.ceil(durate[a["i"]][b["i"]])
@@ -348,6 +353,11 @@ st.sidebar.header("⚙️ Impostazioni")
 
 chiave_ors = segreto("ORS_API_KEY") or st.sidebar.text_input("API Key OpenRouteService", type="password")
 
+partenza_txt = st.sidebar.text_input(
+    "Punto di partenza (vuoto = nessuna partenza)",
+    value=PARTENZA_DEFAULT,
+)
+
 province = sorted(df_anag["Provincia"].dropna().unique())
 if not province:
     st.error("Il foglio Anagrafica non contiene province.")
@@ -369,7 +379,7 @@ st.sidebar.caption(f"Giorno della settimana: **{giorno_sel}**")
 
 anticipo = st.sidebar.number_input("Anticipo (giorni): includi i medici in scadenza entro", 0, 60, 7)
 durata_visita = st.sidebar.number_input("Durata di una visita (minuti)", 5, 120, 20)
-ora_inizio = st.sidebar.time_input("Inizio giornata", value=time(9, 0))
+ora_inizio = st.sidebar.time_input("Inizio giornata (ora di partenza)", value=time(9, 0))
 ora_fine = st.sidebar.time_input("Fine giornata", value=time(18, 0))
 max_visite = st.sidebar.number_input("Numero massimo di visite", 1, 15, 8)
 
@@ -502,8 +512,25 @@ if st.sidebar.button("🚀 Calcola proposta agenda", type="primary"):
     else:
         try:
             with st.spinner("Calcolo indirizzi e tempi di guida..."):
-                validi = []
                 coords = []
+                partenza = None      # {"i": 0} se il punto di partenza è valido
+                partenza_ok = None   # testo dell'indirizzo di partenza, se valido
+
+                # Il punto di partenza è sempre il nodo 0 della matrice
+                if partenza_txt.strip():
+                    coord_p = geocodifica(f"{partenza_txt.strip()}, Italia", chiave_ors)
+                    if coord_p is None:
+                        avvisi.append(
+                            f"Punto di partenza non trovato: '{partenza_txt.strip()}'. "
+                            f"Il giro parte direttamente dalla prima visita."
+                        )
+                    else:
+                        coords.append(coord_p)
+                        partenza = {"i": 0}
+                        partenza_ok = partenza_txt.strip()
+
+                offset = len(coords)
+                validi = []
                 for c in candidati:
                     coord = geocodifica(f"{c['indirizzo']}, Italia", chiave_ors)
                     if coord is None:
@@ -511,14 +538,14 @@ if st.sidebar.button("🚀 Calcola proposta agenda", type="primary"):
                             f"Indirizzo non trovato per {c['nome']}: '{c['indirizzo']}'. Sede esclusa."
                         )
                     else:
-                        c["i"] = len(validi)
+                        c["i"] = len(validi) + offset
                         validi.append(c)
                         coords.append(coord)
 
                 if not validi:
                     raise ValueError("Nessun indirizzo è stato trovato.")
 
-                if len(validi) > 1:
+                if len(coords) > 1:
                     grezze = matrice_durate(tuple(coords), chiave_ors)
                     durate = [
                         [(x if x is not None else 1800) / 60 for x in riga]
@@ -548,6 +575,8 @@ if st.sidebar.button("🚀 Calcola proposta agenda", type="primary"):
             "citta": list(citta_sel),  # lista vuota = tutte le città
             "candidati": validi,
             "durate": durate,
+            "partenza": partenza,
+            "partenza_txt": partenza_ok,
             "rifiutati": set(),  # ID dei medici rifiutati (valgono per tutte le sedi)
             "avvisi": avvisi,
             "inizio": inizio_g,
@@ -558,7 +587,7 @@ if st.sidebar.button("🚀 Calcola proposta agenda", type="primary"):
         }
         st.session_state["agenda"] = pianifica(
             liberi_iniziali, fissi_iniziali, durate, inizio_g, fine_g,
-            durata_int, int(max_visite),
+            durata_int, int(max_visite), partenza,
         )
 
 # -----------------------------------------------------------------------------
@@ -592,6 +621,8 @@ luogo = f"Provincia di {ctx['provincia']}"
 if ctx["citta"]:
     luogo += " — " + ", ".join(ctx["citta"])
 st.subheader(f"📅 {ctx['giorno']} {ctx['data'].strftime('%d/%m/%Y')} — {luogo}")
+if ctx.get("partenza_txt"):
+    st.caption(f"🏁 Partenza da: {ctx['partenza_txt']} alle {minuti_in_orario(ctx['inizio'])}")
 
 for avviso in ctx["avvisi"]:
     st.warning(avviso)
@@ -673,7 +704,7 @@ if agenda and st.button("🔄 Ricalcola giornata"):
     ]
     nuova = pianifica(
         liberi, fissi, ctx["durate"], ctx["inizio"], ctx["fine"],
-        ctx["durata_visita"], ctx["max_visite"],
+        ctx["durata_visita"], ctx["max_visite"], ctx.get("partenza"),
     )
 
     # Rinnova i campi orario: quelli vecchi vengono eliminati
@@ -720,8 +751,11 @@ if attive:
             mime="text/csv",
         )
 
-    # Percorso nell'ordine degli orari impostati
-    tappe = [urllib.parse.quote(a["indirizzo"], safe="") for a in attive]
+    # Percorso nell'ordine degli orari impostati, con partenza come prima tappa
+    tappe = []
+    if ctx.get("partenza_txt"):
+        tappe.append(urllib.parse.quote(ctx["partenza_txt"], safe=""))
+    tappe += [urllib.parse.quote(a["indirizzo"], safe="") for a in attive]
     url_maps = "https://www.google.com/maps/dir/" + "/".join(tappe)
     st.markdown(f"👉 **[Apri il percorso su Google Maps]({url_maps})**")
     st.caption("Google Maps accetta un numero limitato di tappe (circa 10).")
