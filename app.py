@@ -305,7 +305,7 @@ try:
                 "data": d_app,
                 "ora": o_app,
             })
-     else:
+    else:
         st.warning(
             "Foglio 'Appuntamenti': intestazioni non riconosciute. "
             f"Colonne lette dall'app: {', '.join(map(str, df_app.columns))}. "
