@@ -97,13 +97,25 @@ def leggi_data(valore):
 
 
 @st.cache_data(ttl=60, show_spinner=False)
+@st.cache_data(ttl=60, show_spinner=False)
 def leggi_foglio(sheet_id, nome_foglio):
     url = (
         f"https://docs.google.com/spreadsheets/d/{sheet_id}/gviz/tq"
         f"?tqx=out:csv&sheet={urllib.parse.quote(nome_foglio)}"
     )
-    df = pd.read_csv(url, dtype=str)
-    df.columns = [str(c).strip() for c in df.columns]
+    grezzo = pd.read_csv(url, dtype=str, header=None)
+
+    # Cerca, nelle prime 10 righe, quella che contiene "ID_Medico": è l'intestazione
+    riga_intest = 0
+    for i in range(min(10, len(grezzo))):
+        valori = [str(v).strip() for v in grezzo.iloc[i].tolist()]
+        if "ID_Medico" in valori:
+            riga_intest = i
+            break
+
+    df = grezzo.iloc[riga_intest + 1:].copy()
+    df.columns = [str(c).strip() for c in grezzo.iloc[riga_intest]]
+    df = df.reset_index(drop=True)
     df = df.dropna(how="all")
     for col in df.columns:
         df[col] = df[col].apply(lambda x: x.strip() if isinstance(x, str) else x)
@@ -293,11 +305,11 @@ try:
                 "data": d_app,
                 "ora": o_app,
             })
-    else:
+     else:
         st.warning(
-            "Foglio 'Appuntamenti' non trovato o con intestazioni diverse da "
-            "ID_Medico, ID_Sede, Data_Appuntamento, Ora_Appuntamento: "
-            "gli appuntamenti già presi non vengono considerati."
+            "Foglio 'Appuntamenti': intestazioni non riconosciute. "
+            f"Colonne lette dall'app: {', '.join(map(str, df_app.columns))}. "
+            "Servono: ID_Medico, ID_Sede, Data_Appuntamento, Ora_Appuntamento."
         )
 except Exception:
     st.warning(
